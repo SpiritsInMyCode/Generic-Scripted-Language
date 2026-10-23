@@ -13,6 +13,25 @@ out answer
 
 Variables are stored in the current scope. Later assignments overwrite the current value in the active scope.
 
+## Sublibs
+
+Use `sublib` to declare a type with initialized fields and tasks:
+
+```gsl
+sublib Person
+    init name
+    task greet
+        out "Hello, " + name
+
+decl ada = create Person "Ada"
+exec ada.greet
+```
+
+`init` accepts one or more field names, and `create` provides their values in
+the same order. Constructor values can be separated by spaces or commas.
+Sublibs can be nested to create qualified paths, including paths inside
+imported modules. See [Libraries and Imports](libraries.md) for examples.
+
 ## Literals
 
 GSL supports:

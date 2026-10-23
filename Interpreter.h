@@ -173,10 +173,15 @@ inline std::ostream& operator<<(std::ostream& os, const Number& number) {
 }
 
 struct ListValue;
+struct SublibInstance;
 
 class Value {
 public:
-    std::variant<Number, std::string, std::shared_ptr<ListValue>> value;
+    std::variant<
+        Number,
+        std::string,
+        std::shared_ptr<ListValue>,
+        std::shared_ptr<SublibInstance>> value;
 
     Value() : value(Number(0)) {}
     Value(int v) : value(Number(v)) {}
@@ -184,6 +189,8 @@ public:
     Value(const Number& v) : value(v) {}
     Value(const std::string& v) : value(v) {}
     Value(const char* v) : value(std::string(v == nullptr ? "" : v)) {}
+    explicit Value(std::shared_ptr<SublibInstance> instance)
+        : value(std::move(instance)) {}
     explicit Value(std::vector<Value> values);
 
     bool is_string() const noexcept {
@@ -198,12 +205,22 @@ public:
         return std::holds_alternative<std::shared_ptr<ListValue>>(value);
     }
 
+    bool is_sublib_instance() const noexcept {
+        return std::holds_alternative<std::shared_ptr<SublibInstance>>(value);
+    }
+
+    std::shared_ptr<SublibInstance> as_sublib_instance() const;
+    std::string sublib_instance_name() const;
+
     bool is_truthy() const {
         if (is_number()) {
             return std::get<Number>(value).as_double() != 0.0;
         }
         if (is_string()) {
             return !std::get<std::string>(value).empty();
+        }
+        if (is_sublib_instance()) {
+            return true;
         }
         return !as_list().empty();
     }
@@ -287,6 +304,9 @@ public:
         if (is_list() && other.is_list()) {
             return as_list() == other.as_list();
         }
+        if (is_sublib_instance() && other.is_sublib_instance()) {
+            return as_sublib_instance() == other.as_sublib_instance();
+        }
         fail("Operator '==': operands must have the same type.");
     }
 
@@ -356,6 +376,8 @@ inline std::ostream& operator<<(std::ostream& os, const Value& value) {
         os << std::get<Number>(value.value);
     } else if (value.is_string()) {
         os << std::get<std::string>(value.value);
+    } else if (value.is_sublib_instance()) {
+        os << "<" << value.sublib_instance_name() << " instance>";
     } else {
         os << '[';
         const auto& elements = value.as_list();
@@ -430,6 +452,13 @@ public:
         return symbols.find(name) != symbols.end();
     }
 
+    bool contains(const std::string& name) const {
+        if (contains_local(name)) {
+            return true;
+        }
+        return parent != nullptr && parent->contains(name);
+    }
+
     Value get(const std::string& name) const {
         const auto it = symbols.find(name);
         if (it != symbols.end()) {
@@ -442,12 +471,74 @@ public:
     }
 };
 
-using LibraryEntry = std::pair<TasksRegistry, SymbolTable>;
+struct SublibDefinition;
+
+struct SublibScope {
+    std::unordered_map<std::string, std::shared_ptr<SublibDefinition>> definitions;
+};
+
+struct SublibDefinition {
+    std::string name;
+    std::vector<std::string> initFields;
+    TasksRegistry tasks;
+    SymbolTable symbols;
+    std::shared_ptr<SublibScope> sublibs = std::make_shared<SublibScope>();
+};
+
+struct SublibInstance {
+    std::string name;
+    std::shared_ptr<SublibDefinition> definition;
+    SymbolTable symbols;
+
+    explicit SublibInstance(std::shared_ptr<SublibDefinition> definition)
+        : name(definition ? definition->name : "sublib"),
+          definition(std::move(definition)) {
+        if (this->definition) {
+            symbols.parent = &this->definition->symbols;
+        }
+    }
+};
+
+inline std::shared_ptr<SublibInstance> Value::as_sublib_instance() const {
+    if (!is_sublib_instance()) {
+        fail("Expected a sublib instance.");
+    }
+    return std::get<std::shared_ptr<SublibInstance>>(value);
+}
+
+inline std::string Value::sublib_instance_name() const {
+    const auto instance = as_sublib_instance();
+    return instance ? instance->name : "sublib";
+}
+
+struct LibraryEntry {
+    TasksRegistry first;
+    SymbolTable second;
+    std::shared_ptr<SublibScope> sublibs = std::make_shared<SublibScope>();
+
+    LibraryEntry() = default;
+
+    LibraryEntry(
+        TasksRegistry tasks,
+        SymbolTable symbols,
+        std::shared_ptr<SublibScope> sublibs = std::make_shared<SublibScope>()
+    )
+        : first(std::move(tasks)),
+          second(std::move(symbols)),
+          sublibs(std::move(sublibs)) {}
+};
+
 using NativeLibraryFactory = std::function<LibraryEntry()>;
 
 class Interpreter {
     struct ReturnSignal {
         Value value;
+    };
+
+    struct ResolvedNamespace {
+        TasksRegistry* tasks = nullptr;
+        SymbolTable* symbols = nullptr;
+        std::shared_ptr<SublibScope> sublibs;
     };
 
 public:
@@ -458,6 +549,8 @@ public:
     TasksRegistry globalRegistry;
     TasksRegistry *currentFunctionRegistry = &globalRegistry;
     std::unordered_map<std::string, LibraryEntry> libraryRegistry;
+    std::shared_ptr<SublibScope> globalSublibs = std::make_shared<SublibScope>();
+    std::shared_ptr<SublibScope> currentSublibs = globalSublibs;
     std::unordered_map<std::string, NativeLibraryFactory> nativeLibraryFactories;
     std::filesystem::path handlerSourceDirectory;
     std::filesystem::path mainSourceDirectory;
@@ -492,10 +585,103 @@ public:
         }
 
         LibraryEntry library = factory->second();
-        library.first.parent = &globalRegistry;
-        library.second.parent = &globalSymbolTable;
-        libraryRegistry.emplace(name, std::move(library));
+        auto inserted = libraryRegistry.emplace(name, std::move(library));
+        LibraryEntry& registered = inserted.first->second;
+        registered.first.parent = &globalRegistry;
+        registered.second.parent = &globalSymbolTable;
+        if (!registered.sublibs) {
+            registered.sublibs = std::make_shared<SublibScope>();
+        }
+        attachSublibParents(
+            registered.sublibs, &registered.first, &registered.second);
         return true;
+    }
+
+    void attachSublibParents(
+        const std::shared_ptr<SublibScope>& scope,
+        TasksRegistry* parentTasks,
+        SymbolTable* parentSymbols
+    ) {
+        if (!scope) {
+            return;
+        }
+        for (auto& entry : scope->definitions) {
+            if (!entry.second) {
+                continue;
+            }
+            SublibDefinition& definition = *entry.second;
+            definition.tasks.parent = parentTasks;
+            definition.symbols.parent = parentSymbols;
+            attachSublibParents(
+                definition.sublibs,
+                &definition.tasks,
+                &definition.symbols
+            );
+        }
+    }
+
+    std::vector<std::string> splitAccessPath(const std::string& path) const {
+        std::vector<std::string> parts;
+        std::size_t start = 0;
+        while (start <= path.size()) {
+            const std::size_t separator = path.find('.', start);
+            const std::size_t end = separator == std::string::npos
+                ? path.size() : separator;
+            if (end == start) {
+                fail("Access path contains an empty name: " + path);
+            }
+            parts.push_back(path.substr(start, end - start));
+            if (separator == std::string::npos) {
+                break;
+            }
+            start = separator + 1;
+        }
+        return parts;
+    }
+
+    ResolvedNamespace libraryNamespace(const std::string& name) {
+        const auto library = libraryRegistry.find(name);
+        if (library == libraryRegistry.end()) {
+            return {};
+        }
+        return {
+            &library->second.first,
+            &library->second.second,
+            library->second.sublibs
+        };
+    }
+
+    std::shared_ptr<SublibDefinition> resolveSublibDefinition(
+        const std::string& path
+    ) const {
+        const std::vector<std::string> parts = splitAccessPath(path);
+        std::shared_ptr<SublibScope> scope = currentSublibs;
+        std::size_t index = 0;
+        const auto library = libraryRegistry.find(parts.front());
+        if (library != libraryRegistry.end()) {
+            if (!library->second.sublibs) {
+                fail("Unknown sublib: " + path);
+            }
+            scope = library->second.sublibs;
+            index = 1;
+        }
+
+        std::shared_ptr<SublibDefinition> definition;
+        for (; index < parts.size(); ++index) {
+            if (!scope) {
+                fail("Unknown sublib: " + path);
+            }
+            const auto entry = scope->definitions.find(parts[index]);
+            if (entry == scope->definitions.end()) {
+                fail("Unknown sublib: " + path);
+            }
+            definition = entry->second;
+            scope = definition->sublibs;
+        }
+        if (!definition) {
+            fail("Expected a sublib name in '" + path + "'.");
+        }
+        return definition;
     }
 
     void enter_scope(std::unordered_map<std::string, Value> init_variables = {}) {
@@ -598,25 +784,77 @@ public:
     }
 
     Value visit_VarAccessNode(const VarAccessNode& node) const {
-        const std::size_t separator = node.token.value.find('.');
-        if (separator != std::string::npos) {
-            if (node.token.value.find('.', separator + 1) != std::string::npos) {
-                fail("Library access must use the form 'library.member'.");
-            }
-            const std::string libraryName = node.token.value.substr(0, separator);
-            const std::string memberName = node.token.value.substr(separator + 1);
-            const auto library = libraryRegistry.find(libraryName);
-            if (library == libraryRegistry.end()) {
-                fail("Unknown library: " + libraryName);
-            }
-            if (library->second.first.tasks.find(memberName) !=
-                library->second.first.tasks.end()) {
-                fail("Library member '" + node.token.value +
-                     "' is a task; execute it with 'exec'.");
-            }
-            return library->second.second.get(memberName);
+        const std::vector<std::string> parts = splitAccessPath(node.token.value);
+        if (parts.size() == 1) {
+            return currentSymbolTable->get(parts.front());
         }
-        return currentSymbolTable->get(node.token.value);
+
+        if (currentSymbolTable->contains(parts.front())) {
+            Value value = currentSymbolTable->get(parts.front());
+            if (!value.is_sublib_instance()) {
+                fail("Cannot access '" + node.token.value +
+                     "' because '" + parts.front() + "' is not a sublib instance.");
+            }
+            for (std::size_t i = 1; i < parts.size(); ++i) {
+                const auto instance = value.as_sublib_instance();
+                if (!instance || !instance->definition) {
+                    fail("Cannot access a member of an invalid sublib instance.");
+                }
+                if (i + 1 == parts.size()) {
+                    if (instance->definition->tasks.tasks.find(parts[i]) !=
+                        instance->definition->tasks.tasks.end()) {
+                        fail("Sublib member '" + node.token.value +
+                             "' is a task; execute it with 'exec'.");
+                    }
+                    return instance->symbols.get(parts[i]);
+                }
+                if (instance->definition->tasks.tasks.find(parts[i]) !=
+                    instance->definition->tasks.tasks.end()) {
+                    fail("Sublib member '" + parts[i] +
+                         "' is a task; execute it with 'exec'.");
+                }
+                value = instance->symbols.get(parts[i]);
+                if (!value.is_sublib_instance()) {
+                    fail("Cannot access nested member '" + parts[i] +
+                         "' because it is not a sublib instance.");
+                }
+            }
+        }
+
+        ResolvedNamespace space;
+        std::size_t index = 0;
+        if (libraryRegistry.find(parts.front()) != libraryRegistry.end()) {
+            space = const_cast<Interpreter*>(this)->libraryNamespace(parts.front());
+            index = 1;
+        } else {
+            space = {currentFunctionRegistry, currentSymbolTable, currentSublibs};
+        }
+
+        for (; index + 1 < parts.size(); ++index) {
+            if (!space.sublibs) {
+                fail("Unknown library or sublib in access path: " + node.token.value);
+            }
+            const auto sublib = space.sublibs->definitions.find(parts[index]);
+            if (sublib == space.sublibs->definitions.end()) {
+                fail("Unknown library or sublib in access path: " + node.token.value);
+            }
+            space = {
+                &sublib->second->tasks,
+                &sublib->second->symbols,
+                sublib->second->sublibs
+            };
+        }
+
+        const std::string& member = parts.back();
+        if (space.tasks != nullptr &&
+            space.tasks->tasks.find(member) != space.tasks->tasks.end()) {
+            fail("Library member '" + node.token.value +
+                 "' is a task; execute it with 'exec'.");
+        }
+        if (space.symbols == nullptr || !space.symbols->contains(member)) {
+            fail("Undefined variable: " + node.token.value);
+        }
+        return space.symbols->get(member);
     }
 
     Value visit_ScanNode() const {
@@ -629,6 +867,65 @@ public:
     
     void visit_TaskDeclareNode(const TaskDeclareNode& node) {
         currentFunctionRegistry->define(node.ident, Task(node));
+    }
+
+    void visit_SublibDeclareNode(const SublibDeclareNode& node) {
+        if (!currentSublibs) {
+            currentSublibs = std::make_shared<SublibScope>();
+        }
+        if (currentSublibs->definitions.find(node.ident) !=
+            currentSublibs->definitions.end()) {
+            fail("Sublib is already defined: " + node.ident);
+        }
+
+        auto definition = std::make_shared<SublibDefinition>();
+        definition->name = node.ident;
+        definition->initFields = node.initFields;
+        definition->tasks.parent = currentFunctionRegistry;
+        definition->symbols.parent = currentSymbolTable;
+        currentSublibs->definitions.emplace(node.ident, definition);
+
+        TasksRegistry* previousTasks = currentFunctionRegistry;
+        SymbolTable* previousSymbols = currentSymbolTable;
+        std::shared_ptr<SublibScope> previousSublibs = currentSublibs;
+        currentFunctionRegistry = &definition->tasks;
+        currentSymbolTable = &definition->symbols;
+        currentSublibs = definition->sublibs;
+        try {
+            for (const auto& statement : node.statements->statements) {
+                visit(statement);
+            }
+        } catch (...) {
+            currentFunctionRegistry = previousTasks;
+            currentSymbolTable = previousSymbols;
+            currentSublibs = previousSublibs;
+            throw;
+        }
+        currentFunctionRegistry = previousTasks;
+        currentSymbolTable = previousSymbols;
+        currentSublibs = previousSublibs;
+    }
+
+    Value visit_CreateNode(const CreateNode& node) {
+        const auto definition = resolveSublibDefinition(node.ident);
+        if (node.arguments.size() != definition->initFields.size()) {
+            fail("Sublib '" + node.ident + "' expects " +
+                 std::to_string(definition->initFields.size()) +
+                 " init argument(s), got " +
+                 std::to_string(node.arguments.size()) + ".");
+        }
+
+        std::vector<Value> arguments;
+        arguments.reserve(node.arguments.size());
+        for (const auto& argument : node.arguments) {
+            arguments.push_back(visit(argument));
+        }
+
+        auto instance = std::make_shared<SublibInstance>(definition);
+        for (std::size_t i = 0; i < arguments.size(); ++i) {
+            instance->symbols.set(definition->initFields[i], arguments[i]);
+        }
+        return Value(std::move(instance));
     }
 
     std::filesystem::path resolveImportPath(const std::string& filename) const {
@@ -705,13 +1002,19 @@ public:
         LibraryEntry& library = inserted.first->second;
         library.first.parent = &globalRegistry;
         library.second.parent = &globalSymbolTable;
+        if (!library.sublibs) {
+            library.sublibs = std::make_shared<SublibScope>();
+        }
+        const std::shared_ptr<SublibScope> moduleSublibs = library.sublibs;
 
         SymbolTable* previousSymbols = currentSymbolTable;
         TasksRegistry* previousTasks = currentFunctionRegistry;
+        std::shared_ptr<SublibScope> previousSublibs = currentSublibs;
         const std::filesystem::path previousSourceDirectory =
             currentSourceDirectory;
         currentSymbolTable = &library.second;
         currentFunctionRegistry = &library.first;
+        currentSublibs = moduleSublibs;
         currentSourceDirectory = importPath.parent_path();
         try {
             for (const auto& statement : statements->statements) {
@@ -720,11 +1023,13 @@ public:
         } catch (...) {
             currentSymbolTable = previousSymbols;
             currentFunctionRegistry = previousTasks;
+            currentSublibs = previousSublibs;
             currentSourceDirectory = previousSourceDirectory;
             throw;
         }
         currentSymbolTable = previousSymbols;
         currentFunctionRegistry = previousTasks;
+        currentSublibs = previousSublibs;
         currentSourceDirectory = previousSourceDirectory;
     }
 
@@ -777,29 +1082,79 @@ public:
         return std::nullopt;
     }
     std::optional<Value> visit_ExecNode(const ExecNode& node) {
-        const std::size_t separator = node.ident.find('.');
-        const bool qualified = separator != std::string::npos;
+        const std::vector<std::string> parts = splitAccessPath(node.ident);
         Task* task = nullptr;
         TasksRegistry* taskRegistry = currentFunctionRegistry;
         SymbolTable* symbolTable = currentSymbolTable;
-        if (qualified) {
-            if (node.ident.find('.', separator + 1) != std::string::npos) {
-                fail("Task access must use the form 'library.task'.");
+        std::shared_ptr<SublibScope> sublibs = currentSublibs;
+
+        if (parts.size() == 1) {
+            task = currentFunctionRegistry->get(parts.front());
+        } else if (currentSymbolTable->contains(parts.front()) &&
+                   currentSymbolTable->get(parts.front()).is_sublib_instance()) {
+            Value value = currentSymbolTable->get(parts.front());
+            for (std::size_t i = 1; i + 1 < parts.size(); ++i) {
+                const auto instance = value.as_sublib_instance();
+                if (!instance || !instance->definition) {
+                    fail("Cannot access a member of an invalid sublib instance.");
+                }
+                if (instance->definition->tasks.tasks.find(parts[i]) !=
+                    instance->definition->tasks.tasks.end()) {
+                    fail("Task '" + parts[i] +
+                         "' has no nested member in this access path.");
+                }
+                value = instance->symbols.get(parts[i]);
+                if (!value.is_sublib_instance()) {
+                    fail("Cannot access nested member '" + parts[i] +
+                         "' because it is not a sublib instance.");
+                }
             }
-            const std::string libraryName = node.ident.substr(0, separator);
-            const std::string taskName = node.ident.substr(separator + 1);
-            const auto library = libraryRegistry.find(libraryName);
-            if (library == libraryRegistry.end()) {
-                fail("Unknown library: " + libraryName);
+            const auto instance = value.as_sublib_instance();
+            if (!instance || !instance->definition) {
+                fail("Cannot access a member of an invalid sublib instance.");
             }
-            const auto taskEntry = library->second.first.tasks.find(taskName);
-            if (taskEntry != library->second.first.tasks.end()) {
+            const auto taskEntry =
+                instance->definition->tasks.tasks.find(parts.back());
+            if (taskEntry != instance->definition->tasks.tasks.end()) {
                 task = &taskEntry->second;
             }
-            taskRegistry = &library->second.first;
-            symbolTable = &library->second.second;
+            taskRegistry = &instance->definition->tasks;
+            symbolTable = &instance->symbols;
+            sublibs = instance->definition->sublibs;
         } else {
-            task = currentFunctionRegistry->get(node.ident);
+            ResolvedNamespace space;
+            std::size_t index = 0;
+            if (libraryRegistry.find(parts.front()) != libraryRegistry.end()) {
+                space = libraryNamespace(parts.front());
+                index = 1;
+            } else {
+                space = {currentFunctionRegistry, currentSymbolTable, currentSublibs};
+            }
+
+            for (; index + 1 < parts.size(); ++index) {
+                if (!space.sublibs) {
+                    fail("Unknown library or sublib in access path: " + node.ident);
+                }
+                const auto sublib = space.sublibs->definitions.find(parts[index]);
+                if (sublib == space.sublibs->definitions.end()) {
+                    fail("Unknown library or sublib in access path: " + node.ident);
+                }
+                space = {
+                    &sublib->second->tasks,
+                    &sublib->second->symbols,
+                    sublib->second->sublibs
+                };
+            }
+
+            if (space.tasks != nullptr) {
+                const auto taskEntry = space.tasks->tasks.find(parts.back());
+                if (taskEntry != space.tasks->tasks.end()) {
+                    task = &taskEntry->second;
+                }
+            }
+            taskRegistry = space.tasks;
+            symbolTable = space.symbols;
+            sublibs = space.sublibs;
         }
         if (task == nullptr) {
             fail(UndefinedValueError("Cannot find task '" + node.ident + "'"));
@@ -813,16 +1168,20 @@ public:
 
         TasksRegistry* previousTasks = currentFunctionRegistry;
         SymbolTable* previousSymbols = currentSymbolTable;
+        std::shared_ptr<SublibScope> previousSublibs = currentSublibs;
         currentFunctionRegistry = taskRegistry;
         currentSymbolTable = symbolTable;
+        currentSublibs = sublibs;
         try {
             std::optional<Value> result = visit_Task(*task, argumentValues);
             currentFunctionRegistry = previousTasks;
             currentSymbolTable = previousSymbols;
+            currentSublibs = previousSublibs;
             return result;
         } catch (...) {
             currentFunctionRegistry = previousTasks;
             currentSymbolTable = previousSymbols;
+            currentSublibs = previousSublibs;
             throw;
         }
     }
@@ -1054,6 +1413,14 @@ public:
         if (const auto* taskDeclareNode = dynamic_cast<const TaskDeclareNode*>(node.get())) {
             visit_TaskDeclareNode(*taskDeclareNode);
             return Value(0);
+        }
+        if (const auto* sublibDeclareNode =
+                dynamic_cast<const SublibDeclareNode*>(node.get())) {
+            visit_SublibDeclareNode(*sublibDeclareNode);
+            return Value(0);
+        }
+        if (const auto* createNode = dynamic_cast<const CreateNode*>(node.get())) {
+            return visit_CreateNode(*createNode);
         }
         if (const auto* execNode = dynamic_cast<const ExecNode*>(node.get())) {
             std::optional<Value> value = visit_ExecNode(*execNode);

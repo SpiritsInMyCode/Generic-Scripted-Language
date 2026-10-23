@@ -1,12 +1,14 @@
 #pragma once
 
 // Add one include and one registerNativeLibrary call for each native/<name>.h.
-// The header name is the GSL import name. Library::functions and
-// Library::symbols are optional export tables and default to empty when omitted.
+// The header name is the GSL import name. Library::functions,
+// Library::symbols, and Library::sublibs are optional export tables and
+// default to empty when omitted.
 #include "native/std.h"
 #include "native/list.h"
 #include "native/random.h"
 #include "native/Enum.h"
+#include "native/math.h"
 
 #include <type_traits>
 
@@ -26,6 +28,13 @@ template <typename Library>
 struct HasSymbols<Library, std::void_t<decltype(Library::symbols)>>
     : std::true_type {};
 
+template <typename Library, typename = void>
+struct HasSublibs : std::false_type {};
+
+template <typename Library>
+struct HasSublibs<Library, std::void_t<decltype(Library::sublibs)>>
+    : std::true_type {};
+
 inline const NativeFunctionList& emptyFunctions() {
     static const NativeFunctionList functions;
     return functions;
@@ -34,6 +43,11 @@ inline const NativeFunctionList& emptyFunctions() {
 inline const SymbolTable& emptySymbols() {
     static const SymbolTable symbols;
     return symbols;
+}
+
+inline const NativeSublibList& emptySublibs() {
+    static const NativeSublibList sublibs;
+    return sublibs;
 }
 
 template <typename Library>
@@ -54,13 +68,23 @@ const SymbolTable& symbols() {
     }
 }
 
+template <typename Library>
+const NativeSublibList& sublibs() {
+    if constexpr (HasSublibs<Library>::value) {
+        return Library::sublibs;
+    } else {
+        return emptySublibs();
+    }
+}
+
 } // namespace native_library_detail
 
 template <typename Library>
 inline void registerNativeLibrary(Interpreter& interpreter) {
     NativeLibrary library(Library::name,
                           native_library_detail::functions<Library>(),
-                          native_library_detail::symbols<Library>());
+                          native_library_detail::symbols<Library>(),
+                          native_library_detail::sublibs<Library>());
     interpreter.registerNativeLibrary(library.getName(), [library]() {
         return library.createEntry();
     });
@@ -71,6 +95,7 @@ inline void registerBuiltins(Interpreter& interpreter) {
     registerNativeLibrary<ListLibrary>(interpreter);
     registerNativeLibrary<RandomLibrary>(interpreter);
     registerNativeLibrary<Enum>(interpreter);
+    registerNativeLibrary<math>(interpreter);
 
     if (!interpreter.loadNativeLibrary(StdLibrary::name)) {
         fail("Could not load the standard native library.");

@@ -32,7 +32,8 @@ public:
                 dynamic_cast<IfNode*>(statement.get()) != nullptr ||
                 dynamic_cast<LoopNode*>(statement.get()) != nullptr ||
                 dynamic_cast<WhileNode*>(statement.get()) != nullptr ||
-                dynamic_cast<TaskDeclareNode*>(statement.get()) != nullptr;
+                dynamic_cast<TaskDeclareNode*>(statement.get()) != nullptr ||
+                dynamic_cast<SublibDeclareNode*>(statement.get()) != nullptr;
             root->statements.push_back(std::move(statement));
 
             if (peek() != nullptr &&
@@ -131,6 +132,7 @@ private:
         }
         return token->type == TokenType::KEYWRD &&
             (token->value == "exec" ||
+             token->value == "create" ||
              token->value == "scan" ||
              token->value == "@");
     }
@@ -154,16 +156,128 @@ private:
         while (canStartExecArgument()) {
             arguments.push_back(parseCompExpression());
 
-            if (!match(TokenType::SEPARATOR)) {
+            if (match(TokenType::SEPARATOR)) {
+                if (!canStartExecArgument()) {
+                    failAtCurrentToken(InvalidSyntaxError(
+                        "Expected argument after separator"));
+                }
+            } else if (!canStartExecArgument()) {
                 break;
-            }
-            if (!canStartExecArgument()) {
-                failAtCurrentToken(InvalidSyntaxError(
-                    "Expected argument after separator"));
             }
         }
 
         return std::make_unique<ExecNode>(taskIdent, std::move(arguments));
+    }
+
+    std::unique_ptr<ASTNode> parseCreateNode() {
+        advance();
+        if (peek() == nullptr || peek()->type != TokenType::IDENT) {
+            failAtCurrentToken(InvalidSyntaxError(
+                "Expected a sublib name after 'create' keyword"));
+        }
+
+        std::string sublibIdent = advance().value;
+        while (match(TokenType::DOT)) {
+            if (peek() == nullptr || peek()->type != TokenType::IDENT) {
+                failAtCurrentToken(InvalidSyntaxError(
+                    "Expected an identifier after '.'"));
+            }
+            sublibIdent += "." + advance().value;
+        }
+
+        std::vector<std::unique_ptr<ASTNode>> arguments;
+        while (canStartExecArgument()) {
+            arguments.push_back(parseCompExpression());
+
+            if (match(TokenType::SEPARATOR)) {
+                if (!canStartExecArgument()) {
+                    failAtCurrentToken(InvalidSyntaxError(
+                        "Expected argument after separator"));
+                }
+            } else if (!canStartExecArgument()) {
+                break;
+            }
+        }
+
+        return std::make_unique<CreateNode>(
+            std::move(sublibIdent), std::move(arguments));
+    }
+
+    std::unique_ptr<ASTNode> parseSublibDeclareNode() {
+        advance();
+        if (peek() == nullptr || peek()->type != TokenType::IDENT) {
+            failAtCurrentToken(InvalidSyntaxError(
+                "Expected an identifier after 'sublib' keyword"));
+        }
+        const std::string ident = advance().value;
+
+        if (peek() == nullptr || peek()->type != TokenType::NEWLINE) {
+            failAtCurrentToken(InvalidSyntaxError(
+                "Expected a new line after sublib name '" + ident + "'"));
+        }
+        advance();
+        skipNewlines();
+        if (peek() == nullptr || peek()->type != TokenType::INDENT) {
+            failAtCurrentToken(InvalidSyntaxError(
+                "Expected indentation after 'sublib' keyword"));
+        }
+        advance();
+
+        std::vector<std::string> initFields;
+        std::unordered_set<std::string> seenInitFields;
+        auto statements = std::make_unique<StatementsNode>();
+        while (peek() != nullptr && peek()->type != TokenType::DEDENT) {
+            if (match(TokenType::NEWLINE)) {
+                continue;
+            }
+
+            if (peek()->type == TokenType::KEYWRD &&
+                peek()->value == "init") {
+                advance();
+                if (peek() == nullptr || peek()->type != TokenType::IDENT) {
+                    failAtCurrentToken(InvalidSyntaxError(
+                        "Expected an identifier after 'init'"));
+                }
+
+                while (true) {
+                    const std::string field = advance().value;
+                    if (!seenInitFields.insert(field).second) {
+                        fail(InvalidSyntaxError(
+                            "Duplicate init field: '" + field + "'"));
+                    }
+                    initFields.push_back(field);
+                    if (!match(TokenType::SEPARATOR)) {
+                        break;
+                    }
+                    if (peek() == nullptr || peek()->type != TokenType::IDENT) {
+                        failAtCurrentToken(InvalidSyntaxError(
+                            "Expected an identifier after separator"));
+                    }
+                }
+                if (peek() != nullptr && peek()->type != TokenType::NEWLINE &&
+                    peek()->type != TokenType::DEDENT) {
+                    failAtCurrentToken(InvalidSyntaxError(
+                        "Unexpected token after sublib init fields"));
+                }
+                match(TokenType::NEWLINE);
+                continue;
+            }
+
+            auto statement = parseExpression();
+            statements->statements.push_back(std::move(statement));
+            if (peek() != nullptr && peek()->type != TokenType::NEWLINE &&
+                peek()->type != TokenType::DEDENT) {
+                failAtCurrentToken(InvalidSyntaxError(
+                    "Unexpected token '" + peek()->value + "' in sublib body"));
+            }
+            match(TokenType::NEWLINE);
+        }
+        // The lexer emits DEDENT when a following line returns to the outer
+        // indentation. At end of file, accept EOF as the implicit dedent.
+        match(TokenType::DEDENT);
+
+        return std::make_unique<SublibDeclareNode>(
+            ident, std::move(initFields), std::move(statements));
     }
 
     std::unique_ptr<ASTNode> parseCompExpression() {
@@ -283,6 +397,8 @@ private:
                         "Expected a library name after 'unpack'"));
                 }
                 return std::make_unique<UnpackNode>(advance().value);
+            } else if (peek()->value == "sublib") {
+                return parseSublibDeclareNode();
             } else if (peek()->value == "decl") {
 
                 if (lookBack() != nullptr &&
@@ -493,7 +609,9 @@ private:
                     std::move(argumentNames),
                     std::move(usingNames)
                 );
-            } else if (peek()->value == "exec" || peek()->value == "scan") {
+            } else if (peek()->value == "exec" ||
+                       peek()->value == "scan" ||
+                       peek()->value == "create") {
                 return parseCompExpression();
             } else if (peek()->value == "yield") {
                 advance();
@@ -605,6 +723,10 @@ private:
                    token->type == TokenType::KEYWRD &&
                    token->value == "exec") {
             node = parseExecNode();
+        } else if (token != nullptr &&
+                   token->type == TokenType::KEYWRD &&
+                   token->value == "create") {
+            node = parseCreateNode();
         } else if (token != nullptr &&
                    token->type == TokenType::KEYWRD &&
                    token->value == "scan") {

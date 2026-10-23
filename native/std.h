@@ -77,10 +77,6 @@ inline const NativeFunctionList StdLibrary::functions = {
     {"conv",     &StdLibrary::conv},
 };
 
-inline const SymbolTable StdLibrary::symbols = [] {
-    SymbolTable symbols;
-    symbols.set("PI", Value(3.14159265358979323846));
-    return symbols;
-}();
+inline const SymbolTable StdLibrary::symbols = {};
 
 // ============================================================

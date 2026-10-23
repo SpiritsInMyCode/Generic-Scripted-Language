@@ -9,6 +9,7 @@ The interpreter registers the following libraries at startup:
 - `std`
 - `list`
 - `random`
+- `math`
 
 The standard library is always available. The others are native libraries that can be loaded by import or by explicit native registration.
 
@@ -79,3 +80,61 @@ out exec maths.square 4
 ```
 
 This is the standard way to split reusable functionality into separate files.
+
+## Sublibs and nested access
+
+Declare a `sublib` to define a type with per-instance fields and tasks. Each name
+after `init` becomes a field initialized from the matching `create` argument:
+
+```gsl
+sublib Name
+    init name1
+    task print
+        out name1
+
+decl name = create Name "alex"
+exec name.print
+```
+
+Each `create` call gets its own fields. Multiple fields can be listed with
+commas, and `sublib` blocks can contain more `sublib` blocks to make deeper
+namespaces:
+
+```gsl
+sublib tools
+    decl label = "tools"
+    sublib text
+        task echo using value
+            yield value
+
+out tools.label
+out exec tools.text.echo "hello"
+```
+
+Sublibs declared in an imported file are qualified by the module name. For
+example, if `namesLib.gsl` declares `sublib Name`, use:
+
+```gsl
+import "namesLib.gsl"
+decl name = create namesLib.Name "alex"
+exec name.print
+```
+
+Nested module sublibs can be created and accessed with additional dot-separated
+names, such as `create namesLib.tools.Name` or
+`exec namesLib.tools.someTask`.
+
+Native libraries can export the same namespace tree through
+`Library::sublibs` in `native/<name>.h`. Each `NativeSublib` accepts a name,
+native task table, symbol table, child sublibs, and optional ordered `init`
+field names. For example, the built-in math library exports:
+
+```gsl
+import "math"
+out exec math.trig.sin 0
+out math.constants.PI
+```
+
+This prints `0` and the value of pi. Native sublibs can contain deeper
+`NativeSublib` entries, and their tasks and symbols inherit the enclosing
+native namespace.

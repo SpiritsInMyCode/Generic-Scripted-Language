@@ -171,11 +171,37 @@ struct TaskDeclareNode : ASTNode {
           usingNames(std::move(usingNames)) {}
 };
 
+struct SublibDeclareNode : ASTNode {
+    std::string ident;
+    std::vector<std::string> initFields;
+    std::shared_ptr<StatementsNode> statements;
+
+    SublibDeclareNode(
+        std::string ident,
+        std::vector<std::string> initFields,
+        std::unique_ptr<StatementsNode> statements
+    )
+        : ident(std::move(ident)),
+          initFields(std::move(initFields)),
+          statements(std::move(statements)) {}
+};
+
 struct ExecNode : ASTNode {
     std::string ident;
     std::vector<std::unique_ptr<ASTNode>> arguments;
 
     ExecNode(const std::string& ident, std::vector<std::unique_ptr<ASTNode>> arguments)
+        : ident(std::move(ident)), arguments(std::move(arguments)) {}
+};
+
+struct CreateNode : ASTNode {
+    std::string ident;
+    std::vector<std::unique_ptr<ASTNode>> arguments;
+
+    CreateNode(
+        std::string ident,
+        std::vector<std::unique_ptr<ASTNode>> arguments
+    )
         : ident(std::move(ident)), arguments(std::move(arguments)) {}
 };
 

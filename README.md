@@ -8,6 +8,7 @@ GSL is an interpreted scripting language implemented in C++. It uses a custom le
 - Conditional execution
 - Loops
 - User-defined tasks and return values
+- Sublibs with per-instance fields and nested namespaces
 - Input and output
 - Native libraries
 - Nested scopes
